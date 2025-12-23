@@ -31,7 +31,7 @@ export AWS_PAGER=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-AWS_REGION="${AWS_REGION:-eu-central-1}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT_PREFIX="${PROJECT_PREFIX:-m346-facerec}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"

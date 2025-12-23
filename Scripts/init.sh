@@ -1,225 +1,251 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export AWS_PAGER=""
 
-# ============================================================
-# M346 Projekt: FaceRecognition Service (S3 -> Lambda -> S3)
-# Init-Script (idempotent)
-#
-# Erstellt:
-# - S3 In-Bucket (Upload)
-# - S3 Out-Bucket (JSON Resultate)
-# - IAM Rolle + Policy fuer Lambda
-# - Lambda Funktion (Runtime dotnet8) inkl. Env OUTPUT_BUCKET
-# - S3 Trigger (ObjectCreated -> Lambda)
-#
-# Voraussetzungen:
-# - AWS CLI v2 konfiguriert (Learner Lab Credentials)
-# - dotnet SDK 8 installiert
-# - zip installiert (Linux) bzw. verfügbar (Git Bash/WSL)
-#
-# Nutzung:
-#   ./Scripts/init.sh
-#   ENV-Overrides (optional):
-#     AWS_REGION=us-east-1
-#     PROJECT_PREFIX=m346-facerec
-#     IN_BUCKET=<name>
-#     OUT_BUCKET=<name>
-#     LAMBDA_NAME=<name>
-# ============================================================
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
+# -----------------------------
+# Konfiguration (Defaults)
+# -----------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
-PROJECT_PREFIX="${PROJECT_PREFIX:-m346-facerec}"
 
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
-if [[ -z "${ACCOUNT_ID}" || "${ACCOUNT_ID}" == "None" ]]; then
-  echo "FEHLER: AWS CLI ist nicht konfiguriert oder Credentials fehlen (sts get-caller-identity fehlgeschlagen)."
-  exit 1
-fi
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+IN_BUCKET="${IN_BUCKET:-m346-facerec-${ACCOUNT_ID}-in}"
+OUT_BUCKET="${OUT_BUCKET:-m346-facerec-${ACCOUNT_ID}-out}"
 
-# Bucket-Namen muessen global eindeutig sein -> Account-ID verwenden
-IN_BUCKET="${IN_BUCKET:-${PROJECT_PREFIX}-${ACCOUNT_ID}-in}"
-OUT_BUCKET="${OUT_BUCKET:-${PROJECT_PREFIX}-${ACCOUNT_ID}-out}"
+LAMBDA_NAME="${LAMBDA_NAME:-m346-facerec-lambda}"
 
-LAMBDA_NAME="${LAMBDA_NAME:-${PROJECT_PREFIX}-lambda}"
-ROLE_NAME="${ROLE_NAME:-${PROJECT_PREFIX}-lambda-role}"
-POLICY_NAME="${POLICY_NAME:-${PROJECT_PREFIX}-lambda-policy}"
-STATEMENT_ID="${STATEMENT_ID:-${PROJECT_PREFIX}-s3invoke}"
+# Wunschrollenname (wird im Learner Lab oft NICHT erstellbar sein)
+ROLE_NAME="${ROLE_NAME:-m346-facerec-lambda-role}"
+POLICY_NAME="${POLICY_NAME:-m346-facerec-lambda-policy}"
 
-echo "=== Konfiguration ==="
-echo "Region:        ${AWS_REGION}"
-echo "Account ID:    ${ACCOUNT_ID}"
-echo "In-Bucket:     ${IN_BUCKET}"
-echo "Out-Bucket:    ${OUT_BUCKET}"
-echo "Lambda Name:   ${LAMBDA_NAME}"
-echo "Role Name:     ${ROLE_NAME}"
-echo "Policy Name:   ${POLICY_NAME}"
-echo "====================="
+# Fallback-Rollen (Learner Lab typisch)
+FALLBACK_ROLES=("LabRole" "vocareum" "VoclabsRole" "AWSLabRole" "LearnerLabRole")
 
-# ----------------------------
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LAMBDA_SRC_DIR="${ROOT_DIR}/FaceRecognitionLambda/FaceRecognitionLambda"
+PUBLISH_DIR="${LAMBDA_SRC_DIR}/publish"
+ZIP_PATH="${PUBLISH_DIR}/lambda.zip"
+
+# -----------------------------
 # Helpers
-# ----------------------------
+# -----------------------------
+log() { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Command fehlt: $1"
+}
+
 bucket_exists() {
   aws s3api head-bucket --bucket "$1" >/dev/null 2>&1
 }
 
-create_bucket_if_missing() {
-  local bucket="$1"
-  if bucket_exists "$bucket"; then
-    echo "OK: Bucket existiert bereits: ${bucket}"
-    return
+create_bucket() {
+  local b="$1"
+  if bucket_exists "$b"; then
+    log "OK: Bucket existiert bereits: $b"
+    return 0
   fi
 
-  echo "Erstelle Bucket: ${bucket}"
-  # Region-spezifisch: us-east-1 ohne LocationConstraint, sonst mit
-  if [[ "${AWS_REGION}" == "us-east-1" ]]; then
-    aws s3api create-bucket --bucket "${bucket}" >/dev/null
-  else
-    aws s3api create-bucket       --bucket "${bucket}"       --region "${AWS_REGION}"       --create-bucket-configuration LocationConstraint="${AWS_REGION}" >/dev/null
+  log "Erstelle Bucket: $b"
+  # us-east-1: KEIN LocationConstraint
+  aws s3api create-bucket --bucket "$b" --region "$AWS_REGION" >/dev/null
+  log "OK: Bucket erstellt: $b"
+}
+
+get_role_arn_if_exists() {
+  local rn="$1"
+  aws iam get-role --role-name "$rn" --query Role.Arn --output text 2>/dev/null || true
+}
+
+try_create_role_and_policy() {
+  # Trust Policy
+  local trust_doc="${ROOT_DIR}/infra/iam-trust-lambda.json"
+  local policy_tpl="${ROOT_DIR}/infra/iam-policy-template.json"
+
+  [[ -f "$trust_doc" ]] || die "Fehlt: $trust_doc"
+  [[ -f "$policy_tpl" ]] || die "Fehlt: $policy_tpl"
+
+  log "=== IAM Rolle/Policy (optional) ==="
+  log "Versuche IAM Rolle zu erstellen: $ROLE_NAME"
+
+  # CreateRole kann im Learner Lab verboten sein -> Fehler abfangen
+  set +e
+  local create_role_out
+  create_role_out="$(aws iam create-role \
+    --role-name "$ROLE_NAME" \
+    --assume-role-policy-document "file://${trust_doc}" 2>&1)"
+  local rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    if echo "$create_role_out" | grep -qi "AccessDenied"; then
+      warn "iam:CreateRole ist im Learner Lab gesperrt. Nutze vorhandene Lab-Rolle (Fallback)."
+      return 1
+    fi
+    warn "CreateRole fehlgeschlagen: $create_role_out"
+    return 1
   fi
-
-  # Optional: Versioning (hilft bei Nachvollziehbarkeit)
-  aws s3api put-bucket-versioning --bucket "${bucket}" --versioning-configuration Status=Enabled >/dev/null
-
-  echo "OK: Bucket erstellt: ${bucket}"
-}
-
-render_policy() {
-  # Ersetzt Platzhalter ${IN_BUCKET}/${OUT_BUCKET} in Template (bash here-doc replacement)
-  local template_path="${PROJECT_DIR}/infra/lambda-policy.template.json"
-  local out_path="$1"
-  sed     -e "s/\${IN_BUCKET}/${IN_BUCKET}/g"     -e "s/\${OUT_BUCKET}/${OUT_BUCKET}/g"     "${template_path}" > "${out_path}"
-}
-
-ensure_iam_role_and_policy() {
-  echo "=== IAM Rolle/Policy ==="
 
   local role_arn
-  role_arn="$(aws iam get-role --role-name "${ROLE_NAME}" --query Role.Arn --output text 2>/dev/null || true)"
+  role_arn="$(get_role_arn_if_exists "$ROLE_NAME")"
+  [[ -n "$role_arn" ]] || die "Rolle wurde erstellt, aber ARN konnte nicht gelesen werden."
 
-  if [[ -z "${role_arn}" || "${role_arn}" == "None" ]]; then
-    echo "Erstelle IAM Rolle: ${ROLE_NAME}"
-    aws iam create-role       --role-name "${ROLE_NAME}"       --assume-role-policy-document "file://${PROJECT_DIR}/infra/iam-trust-policy.json" >/dev/null
+  log "OK: Rolle erstellt: $ROLE_NAME"
+  log "Role ARN: $role_arn"
+
+  # Policy erstellen (falls bereits existiert -> weiter)
+  # Template mit Bucket-Namen ersetzen
+  local policy_doc_tmp
+  policy_doc_tmp="$(mktemp)"
+  sed \
+    -e "s|__IN_BUCKET__|${IN_BUCKET}|g" \
+    -e "s|__OUT_BUCKET__|${OUT_BUCKET}|g" \
+    -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+    "$policy_tpl" > "$policy_doc_tmp"
+
+  log "Versuche IAM Policy zu erstellen/zu finden: $POLICY_NAME"
+  local policy_arn=""
+  set +e
+  local create_policy_out
+  create_policy_out="$(aws iam create-policy --policy-name "$POLICY_NAME" --policy-document "file://${policy_doc_tmp}" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    policy_arn="$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn | [0]" --output text)"
   else
-    echo "OK: Rolle existiert: ${ROLE_NAME}"
-  fi
-
-  role_arn="$(aws iam get-role --role-name "${ROLE_NAME}" --query Role.Arn --output text)"
-  echo "Role ARN: ${role_arn}"
-
-  # Policy erstellen/finden
-  local policy_arn
-  policy_arn="$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn | [0]" --output text 2>/dev/null || true)"
-
-  local rendered_policy="${PROJECT_DIR}/infra/lambda-policy.rendered.json"
-  render_policy "${rendered_policy}"
-
-  if [[ -z "${policy_arn}" || "${policy_arn}" == "None" ]]; then
-    echo "Erstelle IAM Policy: ${POLICY_NAME}"
-    policy_arn="$(aws iam create-policy --policy-name "${POLICY_NAME}" --policy-document "file://${rendered_policy}" --query Policy.Arn --output text)"
-  else
-    echo "OK: Policy existiert: ${POLICY_NAME}"
-    # Policy aktualisieren (neue Version setzen)
-    # IAM erlaubt max. 5 Versionen -> alte loeschen, falls notwendig
-    local versions
-    versions="$(aws iam list-policy-versions --policy-arn "${policy_arn}" --query "Versions[?IsDefaultVersion==\\`false\\`].VersionId" --output text || true)"
-    # Wenn bereits 4 non-default vorhanden -> eine loeschen
-    local count
-    count="$(aws iam list-policy-versions --policy-arn "${policy_arn}" --query "length(Versions[?IsDefaultVersion==\\`false\\`])" --output text)"
-    if [[ "${count}" -ge 4 ]]; then
-      # Loesche die aelteste non-default Version
-      local oldest
-      oldest="$(aws iam list-policy-versions --policy-arn "${policy_arn}" --query "sort_by(Versions[?IsDefaultVersion==\\`false\\`], &CreateDate)[0].VersionId" --output text)"
-      aws iam delete-policy-version --policy-arn "${policy_arn}" --version-id "${oldest}" >/dev/null || true
+    # Wenn Policy schon existiert, ARN auslesen
+    policy_arn="$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn | [0]" --output text 2>/dev/null || true)"
+    if [[ -z "$policy_arn" || "$policy_arn" == "None" ]]; then
+      warn "CreatePolicy fehlgeschlagen: $create_policy_out"
+      warn "Weiter mit Rolle ohne eigene Policy (kann zu Rekognition/S3-Fehlern fuehren)."
+      rm -f "$policy_doc_tmp"
+      echo "$role_arn"
+      return 0
     fi
-    aws iam create-policy-version --policy-arn "${policy_arn}" --policy-document "file://${rendered_policy}" --set-as-default >/dev/null
   fi
 
-  echo "Policy ARN: ${policy_arn}"
+  log "Policy ARN: $policy_arn"
 
-  # Policy an Rolle haengen (falls noch nicht)
-  local attached
-  attached="$(aws iam list-attached-role-policies --role-name "${ROLE_NAME}" --query "AttachedPolicies[?PolicyArn=='${policy_arn}'] | length(@)" --output text)"
-  if [[ "${attached}" == "0" ]]; then
-    echo "Hänge Policy an Rolle: ${POLICY_NAME} -> ${ROLE_NAME}"
-    aws iam attach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${policy_arn}" >/dev/null
+  # Policy an Rolle anhaengen (kann ebenfalls verboten sein)
+  set +e
+  local attach_out
+  attach_out="$(aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$policy_arn" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    if echo "$attach_out" | grep -qi "AccessDenied"; then
+      warn "attach-role-policy ist im Learner Lab gesperrt. Rolle muss bereits passende Rechte haben."
+    else
+      warn "attach-role-policy fehlgeschlagen: $attach_out"
+    fi
   else
-    echo "OK: Policy ist bereits an Rolle angehängt"
+    log "OK: Policy an Rolle angehaengt."
   fi
 
-  echo "${role_arn}"
+  rm -f "$policy_doc_tmp"
+  echo "$role_arn"
 }
 
-ensure_lambda() {
+resolve_execution_role_arn() {
+  # 1) Existierende Wunschrolle?
+  local arn
+  arn="$(get_role_arn_if_exists "$ROLE_NAME")"
+  if [[ -n "$arn" && "$arn" != "None" ]]; then
+    echo "$arn"
+    return 0
+  fi
+
+  # 2) Versuch Rolle/Policy zu erstellen
+  if arn="$(try_create_role_and_policy)"; then
+    [[ -n "$arn" ]] || die "Interner Fehler: ROLE ARN leer."
+    echo "$arn"
+    return 0
+  fi
+
+  # 3) Fallback: typische LabRole(s)
+  for r in "${FALLBACK_ROLES[@]}"; do
+    arn="$(get_role_arn_if_exists "$r")"
+    if [[ -n "$arn" && "$arn" != "None" ]]; then
+      warn "Verwende vorhandene Ausfuehrungsrolle: $r"
+      echo "$arn"
+      return 0
+    fi
+  done
+
+  die "Keine verwendbare IAM Rolle gefunden. Im Learner Lab existiert meist 'LabRole'. Bitte in IAM Roles nachsehen und FALLBACK_ROLES in init.sh anpassen."
+}
+
+deploy_lambda() {
   local role_arn="$1"
-  echo "=== Lambda Deploy ==="
 
-  # Build + Package
-  local build_dir="${PROJECT_DIR}/dist"
-  rm -rf "${build_dir}"
-  mkdir -p "${build_dir}"
+  log "=== Lambda Deploy ==="
+  require_cmd dotnet
+  require_cmd zip
 
-  echo "dotnet publish (net8.0) ..."
-  dotnet publish "${PROJECT_DIR}/FaceRecognitionLambda.csproj" -c Release -o "${build_dir}" >/dev/null
+  log "dotnet publish (net8.0) ..."
+  dotnet publish "${LAMBDA_SRC_DIR}/FaceRecognitionLambda.csproj" -c Release -o "$PUBLISH_DIR" >/dev/null
 
-  local zip_path="${PROJECT_DIR}/dist/lambda.zip"
-  (cd "${build_dir}" && zip -qr "${zip_path}" .)
+  # ZIP neu erzeugen (idempotent)
+  rm -f "$ZIP_PATH"
+  (cd "$PUBLISH_DIR" && zip -r "lambda.zip" . >/dev/null)
 
-  # Handler: Assembly::Namespace.Class::Method
-  local handler="FaceRecognitionLambda::FaceRecognitionLambda.Function::FunctionHandler"
-  local function_arn
-  function_arn="$(aws lambda get-function --function-name "${LAMBDA_NAME}" --query Configuration.FunctionArn --output text 2>/dev/null || true)"
+  # Exists?
+  if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+    log "Update Lambda Code: $LAMBDA_NAME"
+    aws lambda update-function-code \
+      --function-name "$LAMBDA_NAME" \
+      --zip-file "fileb://${ZIP_PATH}" \
+      --region "$AWS_REGION" >/dev/null
 
-  if [[ -z "${function_arn}" || "${function_arn}" == "None" ]]; then
-    echo "Erstelle Lambda Funktion: ${LAMBDA_NAME}"
-    aws lambda create-function       --function-name "${LAMBDA_NAME}"       --runtime dotnet8       --handler "${handler}"       --role "${role_arn}"       --zip-file "fileb://${zip_path}"       --timeout 30       --memory-size 256       --environment "Variables={OUTPUT_BUCKET=${OUT_BUCKET}}"       --region "${AWS_REGION}" >/dev/null
+    log "OK: Lambda Code aktualisiert."
   else
-    echo "OK: Lambda existiert -> Update Code/Config"
+    log "Erstelle Lambda Funktion: $LAMBDA_NAME"
+    aws lambda create-function \
+      --function-name "$LAMBDA_NAME" \
+      --runtime dotnet8 \
+      --handler "FaceRecognitionLambda::FaceRecognitionLambda.Function::FunctionHandler" \
+      --role "$role_arn" \
+      --zip-file "fileb://${ZIP_PATH}" \
+      --timeout 30 \
+      --memory-size 256 \
+      --region "$AWS_REGION" >/dev/null
 
-    aws lambda update-function-code       --function-name "${LAMBDA_NAME}"       --zip-file "fileb://${zip_path}"       --region "${AWS_REGION}" >/dev/null
-
-    aws lambda update-function-configuration       --function-name "${LAMBDA_NAME}"       --handler "${handler}"       --timeout 30       --memory-size 256       --environment "Variables={OUTPUT_BUCKET=${OUT_BUCKET}}"       --region "${AWS_REGION}" >/dev/null
+    log "OK: Lambda erstellt."
   fi
 
-  # Warte bis Lambda bereit
-  aws lambda wait function-active --function-name "${LAMBDA_NAME}" --region "${AWS_REGION}"
-
-  function_arn="$(aws lambda get-function --function-name "${LAMBDA_NAME}" --query Configuration.FunctionArn --output text --region "${AWS_REGION}")"
-  echo "Lambda ARN: ${function_arn}"
+  # Warten bis aktiv
+  aws lambda wait function-active --function-name "$LAMBDA_NAME" --region "$AWS_REGION"
+  log "OK: Lambda aktiv."
 }
 
-ensure_s3_invoke_permission() {
-  echo "=== Lambda Permission fuer S3 ==="
-  local bucket_arn="arn:aws:s3:::${IN_BUCKET}"
+configure_s3_trigger() {
+  log "=== S3 Trigger konfigurieren ==="
 
-  # Prüfen ob Statement existiert
-  local exists="0"
-  if aws lambda get-policy --function-name "${LAMBDA_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    exists="$(aws lambda get-policy --function-name "${LAMBDA_NAME}" --region "${AWS_REGION}"       --query "Policy" --output text | grep -c ""Sid":"${STATEMENT_ID}"" || true)"
-  fi
-
-  if [[ "${exists}" == "0" ]]; then
-    echo "Füge add-permission hinzu (Sid=${STATEMENT_ID})"
-    aws lambda add-permission       --function-name "${LAMBDA_NAME}"       --statement-id "${STATEMENT_ID}"       --action "lambda:InvokeFunction"       --principal s3.amazonaws.com       --source-arn "${bucket_arn}"       --region "${AWS_REGION}" >/dev/null
-  else
-    echo "OK: Permission existiert bereits"
-  fi
-}
-
-ensure_bucket_notification() {
-  echo "=== S3 Notification (Trigger) ==="
   local lambda_arn
-  lambda_arn="$(aws lambda get-function --function-name "${LAMBDA_NAME}" --query Configuration.FunctionArn --output text --region "${AWS_REGION}")"
+  lambda_arn="$(aws lambda get-function --function-name "$LAMBDA_NAME" --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text)"
+  [[ -n "$lambda_arn" ]] || die "Lambda ARN konnte nicht gelesen werden."
 
-  local notif_file="${PROJECT_DIR}/infra/s3-notification.json"
-  cat > "${notif_file}" <<EOF
+  # Permission fuer S3 -> Lambda (idempotent per StatementId)
+  local statement_id="s3invoke-${IN_BUCKET}"
+  set +e
+  aws lambda add-permission \
+    --function-name "$LAMBDA_NAME" \
+    --statement-id "$statement_id" \
+    --action "lambda:InvokeFunction" \
+    --principal s3.amazonaws.com \
+    --source-arn "arn:aws:s3:::${IN_BUCKET}" \
+    --region "$AWS_REGION" >/dev/null 2>&1
+  set -e
+
+  # Notification Configuration setzen (ersetzt bestehende)
+  local notif_tmp
+  notif_tmp="$(mktemp)"
+  cat > "$notif_tmp" <<EOF
 {
   "LambdaFunctionConfigurations": [
     {
-      "Id": "${PROJECT_PREFIX}-objectcreated",
       "LambdaFunctionArn": "${lambda_arn}",
       "Events": ["s3:ObjectCreated:*"]
     }
@@ -227,26 +253,38 @@ ensure_bucket_notification() {
 }
 EOF
 
-  aws s3api put-bucket-notification-configuration     --bucket "${IN_BUCKET}"     --notification-configuration "file://${notif_file}"     --region "${AWS_REGION}" >/dev/null
+  aws s3api put-bucket-notification-configuration \
+    --bucket "$IN_BUCKET" \
+    --notification-configuration "file://${notif_tmp}" \
+    --region "$AWS_REGION" >/dev/null
 
-  echo "OK: Trigger gesetzt (S3:ObjectCreated:* -> ${LAMBDA_NAME})"
+  rm -f "$notif_tmp"
+  log "OK: S3 Trigger gesetzt (In-Bucket -> Lambda)."
 }
 
-# ----------------------------
-# MAIN
-# ----------------------------
-create_bucket_if_missing "${IN_BUCKET}"
-create_bucket_if_missing "${OUT_BUCKET}"
+# -----------------------------
+# Main
+# -----------------------------
+log "=== Konfiguration ==="
+log "Region:        ${AWS_REGION}"
+log "Account ID:    ${ACCOUNT_ID}"
+log "In-Bucket:     ${IN_BUCKET}"
+log "Out-Bucket:    ${OUT_BUCKET}"
+log "Lambda Name:   ${LAMBDA_NAME}"
+log "Role Name:     ${ROLE_NAME}"
+log "Policy Name:   ${POLICY_NAME}"
+log "====================="
 
-ROLE_ARN="$(ensure_iam_role_and_policy)"
-# IAM propagation: kurz warten, damit create-function nicht sporadisch scheitert
-sleep 5
+create_bucket "$IN_BUCKET"
+create_bucket "$OUT_BUCKET"
 
-ensure_lambda "${ROLE_ARN}"
-ensure_s3_invoke_permission
-ensure_bucket_notification
+ROLE_ARN="$(resolve_execution_role_arn)"
+log "Execution Role ARN: ${ROLE_ARN}"
 
-echo
-echo "FERTIG."
-echo "Naechster Schritt (Test):"
-echo "  ./Scripts/test.sh ./docs/sample-images/<dein_bild>.jpg"
+deploy_lambda "$ROLE_ARN"
+configure_s3_trigger
+
+log ""
+log "=== Fertig ==="
+log "Upload ins In-Bucket:  s3://${IN_BUCKET}"
+log "Ergebnisse im Out-Bucket: s3://${OUT_BUCKET}"

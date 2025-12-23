@@ -197,7 +197,6 @@ deploy_lambda() {
   log "dotnet publish (net8.0) ..."
   dotnet publish "$CSPROJ_PATH" -c Release -o "$PUBLISH_DIR"
 
-
   # ZIP neu erzeugen (idempotent)
   rm -f "$ZIP_PATH"
   (cd "$PUBLISH_DIR" && zip -r "lambda.zip" . >/dev/null)
@@ -229,7 +228,19 @@ deploy_lambda() {
   # Warten bis aktiv
   aws lambda wait function-active --function-name "$LAMBDA_NAME" --region "$AWS_REGION"
   log "OK: Lambda aktiv."
+
+  # Environment Variablen setzen (idempotent) - zwingend fuer Function.cs
+  log "Setze Lambda Environment Variablen (OUTPUT_BUCKET/INPUT_BUCKET/AWS_REGION) ..."
+  aws lambda update-function-configuration \
+    --function-name "$LAMBDA_NAME" \
+    --region "$AWS_REGION" \
+    --environment "Variables={OUTPUT_BUCKET=${OUT_BUCKET},INPUT_BUCKET=${IN_BUCKET},AWS_REGION=${AWS_REGION}}" >/dev/null
+
+  # Warten bis Konfiguration angewendet ist
+  aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$AWS_REGION"
+  log "OK: Lambda Konfiguration aktualisiert."
 }
+
 
 configure_s3_trigger() {
   log "=== S3 Trigger konfigurieren ==="

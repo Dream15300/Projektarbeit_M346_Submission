@@ -230,16 +230,18 @@ deploy_lambda() {
   log "OK: Lambda aktiv."
 
   # Environment Variablen setzen (idempotent) - zwingend fuer Function.cs
-  log "Setze Lambda Environment Variablen (OUTPUT_BUCKET/INPUT_BUCKET/AWS_REGION) ..."
+  # AWS_REGION NICHT setzen (reservierter Key in Lambda)
+  log "Setze Lambda Environment Variablen (OUTPUT_BUCKET/INPUT_BUCKET) ..."
   aws lambda update-function-configuration \
     --function-name "$LAMBDA_NAME" \
     --region "$AWS_REGION" \
-    --environment "Variables={OUTPUT_BUCKET=${OUT_BUCKET},INPUT_BUCKET=${IN_BUCKET},AWS_REGION=${AWS_REGION}}" >/dev/null
+    --environment "Variables={OUTPUT_BUCKET=${OUT_BUCKET},INPUT_BUCKET=${IN_BUCKET}}" >/dev/null
 
   # Warten bis Konfiguration angewendet ist
   aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$AWS_REGION"
   log "OK: Lambda Konfiguration aktualisiert."
 }
+
 
 
 configure_s3_trigger() {

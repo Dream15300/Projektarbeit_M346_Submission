@@ -59,8 +59,9 @@ get_role_arn_if_exists() {
 
 try_create_role_and_policy() {
   # Trust Policy
-  local trust_doc="${ROOT_DIR}/infra/iam-trust-lambda.json"
-  local policy_tpl="${ROOT_DIR}/infra/iam-policy-template.json"
+  local trust_doc="${ROOT_DIR}/infra/iam-trust-policy.json"
+  local policy_tpl="${ROOT_DIR}/infra/lambda-policy.template.json"
+
 
   [[ -f "$trust_doc" ]] || die "Fehlt: $trust_doc"
   [[ -f "$policy_tpl" ]] || die "Fehlt: $policy_tpl"
